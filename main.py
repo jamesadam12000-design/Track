@@ -11,8 +11,8 @@ TOKEN = os.environ.get('DISCORD_BOT_TOKEN')
 GUILD_ID = int(os.environ.get('GUILD_ID', '1271223880975126689'))
 API_ENDPOINT = os.environ.get('API_ENDPOINT', 'https://bsyw-profile.vercel.app/api/presence')
 API_SECRET = os.environ.get('API_SECRET', 'Bisaya-Presence-2024-SecretKey!')
-AFK_CHANNEL_ID = int(os.environ.get('AFK_CHANNEL_ID', '0'))  # Add your AFK voice channel ID
-AFK_TIMEOUT_MINUTES = int(os.environ.get('AFK_TIMEOUT_MINUTES', '5'))  # Default 5 minutes
+AFK_CHANNEL_ID = int(os.environ.get('AFK_CHANNEL_ID', '1537088478687531168'))  # Add your AFK voice channel ID
+AFK_TIMEOUT_MINUTES = int(os.environ.get('AFK_TIMEOUT_MINUTES', '1'))  # Default 5 minutes
 
 # Enable necessary intents
 intents = discord.Intents.default()
