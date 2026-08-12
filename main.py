@@ -4,27 +4,36 @@ import os
 import asyncio
 import aiohttp
 from discord.ext import commands
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # Get configuration from environment variables
 TOKEN = os.environ.get('DISCORD_BOT_TOKEN')
 GUILD_ID = int(os.environ.get('GUILD_ID', '1271223880975126689'))
 API_ENDPOINT = os.environ.get('API_ENDPOINT', 'https://bsyw-profile.vercel.app/api/presence')
 API_SECRET = os.environ.get('API_SECRET', 'Bisaya-Presence-2024-SecretKey!')
+AFK_CHANNEL_ID = int(os.environ.get('AFK_CHANNEL_ID', '0'))  # Add your AFK voice channel ID
+AFK_TIMEOUT_MINUTES = int(os.environ.get('AFK_TIMEOUT_MINUTES', '5'))  # Default 5 minutes
 
 # Enable necessary intents
 intents = discord.Intents.default()
 intents.presences = True
 intents.members = True
 intents.message_content = True
+intents.voice_states = True  # Required for voice tracking
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+# Store voice activity tracking
+voice_activity = {}  # {user_id: {"channel_id": channel_id, "last_active": timestamp, "afk_warning_sent": False}}
+afk_tasks = {}  # {user_id: asyncio.Task}
 
 @bot.event
 async def on_ready():
     print(f"✅ {bot.user} is online!")
     print(f"📊 Bot ID: {bot.user.id}")
     print(f"📡 API Endpoint: {API_ENDPOINT}")
+    print(f"🎙️ AFK Channel ID: {AFK_CHANNEL_ID}")
+    print(f"⏰ AFK Timeout: {AFK_TIMEOUT_MINUTES} minutes")
     
     # Get guild
     guild = bot.get_guild(GUILD_ID)
@@ -32,10 +41,31 @@ async def on_ready():
         print(f"📋 Connected to server: {guild.name}")
         print(f"👥 Members: {len(guild.members)}")
         
-        # Initial sync of all members
+        # Check if AFK channel exists
+        if AFK_CHANNEL_ID:
+            afk_channel = guild.get_channel(AFK_CHANNEL_ID)
+            if afk_channel:
+                print(f"✅ AFK Channel found: {afk_channel.name}")
+                # Move users who are already in AFK channel to be properly set
+                for member in afk_channel.members:
+                    if not member.bot:
+                        await move_to_afk(member, afk_channel)
+            else:
+                print(f"❌ AFK Channel with ID {AFK_CHANNEL_ID} not found!")
+        else:
+            print("⚠️ No AFK Channel ID set. Set AFK_CHANNEL_ID environment variable.")
+        
+        # Initial sync of all members for presence tracking
         for member in guild.members:
             if not member.bot:  # Skip other bots
                 await update_member_presence(member)
+                # Initialize voice tracking for members in voice channels
+                if member.voice and member.voice.channel:
+                    voice_activity[member.id] = {
+                        "channel_id": member.voice.channel.id,
+                        "last_active": datetime.now(),
+                        "afk_warning_sent": False
+                    }
         print("✅ Initial member sync complete!")
     else:
         print(f"❌ Could not find server with ID {GUILD_ID}")
@@ -47,6 +77,160 @@ async def on_presence_update(before, after):
     if not after.bot:  # Skip bots
         print(f"🔄 Presence update for {after.name}")
         await update_member_presence(after)
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    """Track voice state changes for AFK management"""
+    if member.bot:
+        return
+    
+    # User joined a voice channel
+    if after.channel and not before.channel:
+        print(f"🎙️ {member.name} joined voice channel: {after.channel.name}")
+        # Reset tracking
+        voice_activity[member.id] = {
+            "channel_id": after.channel.id,
+            "last_active": datetime.now(),
+            "afk_warning_sent": False
+        }
+        # Cancel any existing AFK task
+        if member.id in afk_tasks:
+            afk_tasks[member.id].cancel()
+            del afk_tasks[member.id]
+    
+    # User moved to a different voice channel
+    elif after.channel and before.channel and after.channel.id != before.channel.id:
+        print(f"🎙️ {member.name} moved from {before.channel.name} to {after.channel.name}")
+        # Check if moved to AFK channel manually
+        if AFK_CHANNEL_ID and after.channel.id == AFK_CHANNEL_ID:
+            await move_to_afk(member, after.channel)
+            return
+        
+        # Reset tracking for new channel
+        voice_activity[member.id] = {
+            "channel_id": after.channel.id,
+            "last_active": datetime.now(),
+            "afk_warning_sent": False
+        }
+        # Cancel any existing AFK task
+        if member.id in afk_tasks:
+            afk_tasks[member.id].cancel()
+            del afk_tasks[member.id]
+        
+        # Start AFK timer for the new channel
+        if AFK_CHANNEL_ID and after.channel.id != AFK_CHANNEL_ID:
+            await start_afk_timer(member)
+    
+    # User left voice channel
+    elif not after.channel and before.channel:
+        print(f"🎙️ {member.name} left voice channel: {before.channel.name}")
+        # Remove from tracking
+        if member.id in voice_activity:
+            del voice_activity[member.id]
+        # Cancel AFK task
+        if member.id in afk_tasks:
+            afk_tasks[member.id].cancel()
+            del afk_tasks[member.id]
+    
+    # User muted/unmuted or deafened/undeafened - update last active time
+    elif after.channel and before.channel and after.channel.id == before.channel.id:
+        # Check if user spoke (unmuted or undeafened)
+        if (before.self_mute and not after.self_mute) or (before.self_deaf and not after.self_deaf):
+            print(f"🎙️ {member.name} became active in voice")
+            if member.id in voice_activity:
+                voice_activity[member.id]["last_active"] = datetime.now()
+                voice_activity[member.id]["afk_warning_sent"] = False
+                # Reset AFK timer
+                if member.id in afk_tasks:
+                    afk_tasks[member.id].cancel()
+                    del afk_tasks[member.id]
+                await start_afk_timer(member)
+
+@bot.event
+async def on_voice_channel_update(channel):
+    """Triggered when a voice channel is updated"""
+    # This can be used to detect if AFK channel settings change
+    pass
+
+async def start_afk_timer(member):
+    """Start an AFK timer for a member"""
+    if member.id in afk_tasks:
+        afk_tasks[member.id].cancel()
+    
+    task = asyncio.create_task(afk_timeout_task(member))
+    afk_tasks[member.id] = task
+
+async def afk_timeout_task(member):
+    """Task that waits for AFK timeout and moves user to AFK channel"""
+    try:
+        # Wait for the AFK timeout period
+        await asyncio.sleep(AFK_TIMEOUT_MINUTES * 60)
+        
+        # Check if member is still in voice and not already in AFK channel
+        if not member.voice or not member.voice.channel:
+            return
+        
+        # Check if the channel is the AFK channel (shouldn't happen but just in case)
+        if AFK_CHANNEL_ID and member.voice.channel.id == AFK_CHANNEL_ID:
+            return
+        
+        # Get the AFK channel
+        afk_channel = member.guild.get_channel(AFK_CHANNEL_ID)
+        if not afk_channel:
+            print(f"❌ AFK Channel not found for {member.name}")
+            return
+        
+        # Check if user has been inactive (no unmute/undeafen events)
+        if member.id in voice_activity:
+            last_active = voice_activity[member.id]["last_active"]
+            time_since_active = (datetime.now() - last_active).total_seconds()
+            
+            # Only move if truly inactive
+            if time_since_active >= AFK_TIMEOUT_MINUTES * 60:
+                await move_to_afk(member, afk_channel)
+            else:
+                # User became active, restart timer
+                await start_afk_timer(member)
+        else:
+            # User not in tracking, move to AFK
+            await move_to_afk(member, afk_channel)
+            
+    except asyncio.CancelledError:
+        # Task was cancelled, clean up
+        pass
+    except Exception as e:
+        print(f"❌ Error in AFK timeout task for {member.name}: {e}")
+
+async def move_to_afk(member, afk_channel):
+    """Move a member to the AFK channel and mute/deafen them"""
+    try:
+        # Move to AFK channel
+        await member.move_to(afk_channel)
+        print(f"🔇 Moved {member.name} to AFK channel: {afk_channel.name}")
+        
+        # Wait a moment for the move to complete
+        await asyncio.sleep(0.5)
+        
+        # Mute and deafen the member
+        await member.edit(mute=True, deafen=True)
+        print(f"🔇 Muted and deafened {member.name}")
+        
+        # Send a DM notification (optional)
+        try:
+            await member.send(f"🔇 You were moved to {afk_channel.name} and muted/deafened due to {AFK_TIMEOUT_MINUTES} minutes of inactivity.")
+        except discord.Forbidden:
+            pass  # User has DMs disabled
+        
+        # Clean up tracking
+        if member.id in voice_activity:
+            del voice_activity[member.id]
+        if member.id in afk_tasks:
+            del afk_tasks[member.id]
+            
+    except discord.Forbidden:
+        print(f"❌ Missing permissions to move {member.name}")
+    except discord.HTTPException as e:
+        print(f"❌ Error moving {member.name}: {e}")
 
 async def update_member_presence(member):
     """Extract and send presence data to your website"""
@@ -274,6 +458,7 @@ async def stats(ctx):
     custom = 0
     online_count = 0
     decorations = 0
+    voice_members = 0
     
     for member in guild.members:
         if member.bot:
@@ -283,6 +468,9 @@ async def stats(ctx):
         # Check for decoration
         if hasattr(member, 'avatar_decoration') and member.avatar_decoration:
             decorations += 1
+        # Check voice
+        if member.voice and member.voice.channel:
+            voice_members += 1
         for activity in member.activities:
             if activity.type == discord.ActivityType.playing:
                 games += 1
@@ -300,6 +488,7 @@ async def stats(ctx):
     embed.add_field(name="Listening to Spotify", value=str(spotify), inline=True)
     embed.add_field(name="Custom Status", value=str(custom), inline=True)
     embed.add_field(name="Avatar Decorations", value=str(decorations), inline=True)
+    embed.add_field(name="In Voice Channels", value=str(voice_members), inline=True)
     embed.set_footer(text="Bisaya Presence Tracker")
     
     await ctx.send(embed=embed)
@@ -322,6 +511,14 @@ async def check_my_activity(ctx):
             response += f"Avatar Decoration: ✨ {decoration}\n"
     else:
         response += "Avatar Decoration: None\n"
+    
+    # Check voice status
+    if member.voice and member.voice.channel:
+        response += f"Voice Channel: {member.voice.channel.name}\n"
+        response += f"Muted: {member.voice.self_mute or member.voice.mute}\n"
+        response += f"Deafened: {member.voice.self_deaf or member.voice.deaf}\n"
+    else:
+        response += "Voice: Not in a voice channel\n"
     
     if len(member.activities) == 0:
         response += "\n❌ **NO ACTIVITIES DETECTED**\n"
@@ -375,7 +572,7 @@ async def diagnose(ctx, member: discord.Member = None):
     # Check 1: Bot's intents
     embed.add_field(
         name="🤖 Bot Intents",
-        value=f"Presences Intent: {bot.intents.presences}\nMembers Intent: {bot.intents.members}",
+        value=f"Presences Intent: {bot.intents.presences}\nMembers Intent: {bot.intents.members}\nVoice States: {bot.intents.voice_states}",
         inline=False
     )
     
@@ -402,7 +599,15 @@ async def diagnose(ctx, member: discord.Member = None):
     # Check 3: Activities count
     embed.add_field(name="🎮 Activities Count", value=str(len(member.activities)), inline=True)
     
-    # Check 4: Detailed activities
+    # Check 4: Voice status
+    voice_info = "Not in voice"
+    if member.voice and member.voice.channel:
+        voice_info = f"Channel: {member.voice.channel.name}\n"
+        voice_info += f"Muted: {member.voice.self_mute or member.voice.mute}\n"
+        voice_info += f"Deafened: {member.voice.self_deaf or member.voice.deaf}"
+    embed.add_field(name="🎙️ Voice Status", value=voice_info, inline=True)
+    
+    # Check 5: Detailed activities
     if len(member.activities) == 0:
         embed.add_field(
             name="⚠️ NO ACTIVITIES DETECTED",
@@ -452,11 +657,11 @@ async def diagnose(ctx, member: discord.Member = None):
             
             embed.add_field(name=f"Activity {i+1}", value=details, inline=False)
     
-    # Check 5: Bot's permissions
+    # Check 6: Bot's permissions
     permissions = ctx.guild.me.guild_permissions
     embed.add_field(
         name="👮 Bot Permissions",
-        value=f"View Members: {permissions.view_members}\nRead Messages: {permissions.read_messages}",
+        value=f"View Members: {permissions.view_members}\nRead Messages: {permissions.read_messages}\nMove Members: {permissions.move_members}\nMute Members: {permissions.mute_members}\nDeafen Members: {permissions.deafen_members}",
         inline=False
     )
     
@@ -472,6 +677,101 @@ async def forcecheck(ctx, member: discord.Member = None):
     await update_member_presence(member)
     await ctx.send("✅ Check complete! Check the bot logs for details.")
 
+@bot.command(name="setafk")
+@commands.has_permissions(administrator=True)
+async def set_afk_channel(ctx, channel: discord.VoiceChannel = None):
+    """Set the AFK voice channel (Admin only)"""
+    global AFK_CHANNEL_ID
+    
+    if not channel:
+        await ctx.send("❌ Please specify a voice channel. Usage: `!setafk #channel`")
+        return
+    
+    AFK_CHANNEL_ID = channel.id
+    await ctx.send(f"✅ AFK channel set to: {channel.name}")
+
+@bot.command(name="afktime")
+@commands.has_permissions(administrator=True)
+async def set_afk_timeout(ctx, minutes: int):
+    """Set the AFK timeout in minutes (Admin only)"""
+    global AFK_TIMEOUT_MINUTES
+    
+    if minutes < 1:
+        await ctx.send("❌ Timeout must be at least 1 minute")
+        return
+    
+    AFK_TIMEOUT_MINUTES = minutes
+    await ctx.send(f"✅ AFK timeout set to {minutes} minutes")
+
+@bot.command(name="afkstatus")
+async def afk_status(ctx):
+    """Check AFK system status"""
+    guild = ctx.guild
+    
+    embed = discord.Embed(title="🎙️ AFK System Status", color=0x00ff00)
+    
+    # AFK Channel info
+    if AFK_CHANNEL_ID:
+        afk_channel = guild.get_channel(AFK_CHANNEL_ID)
+        if afk_channel:
+            embed.add_field(name="AFK Channel", value=f"{afk_channel.name} ({len(afk_channel.members)} users)", inline=True)
+        else:
+            embed.add_field(name="AFK Channel", value="❌ Not found", inline=True)
+    else:
+        embed.add_field(name="AFK Channel", value="❌ Not set", inline=True)
+    
+    embed.add_field(name="Timeout", value=f"{AFK_TIMEOUT_MINUTES} minutes", inline=True)
+    
+    # Users in AFK
+    if AFK_CHANNEL_ID:
+        afk_channel = guild.get_channel(AFK_CHANNEL_ID)
+        if afk_channel and afk_channel.members:
+            afk_users = ", ".join([m.name for m in afk_channel.members if not m.bot])
+            embed.add_field(name="Users in AFK", value=afk_users[:1024], inline=False)
+        else:
+            embed.add_field(name="Users in AFK", value="None", inline=True)
+    
+    # Active voice users
+    active_users = []
+    for member in guild.members:
+        if not member.bot and member.voice and member.voice.channel and member.voice.channel.id != AFK_CHANNEL_ID:
+            active_users.append(member.name)
+    
+    if active_users:
+        embed.add_field(name="Active Voice Users", value=f"{len(active_users)} users", inline=True)
+    else:
+        embed.add_field(name="Active Voice Users", value="None", inline=True)
+    
+    await ctx.send(embed=embed)
+
+@bot.command(name="afkclear")
+@commands.has_permissions(administrator=True)
+async def afk_clear(ctx):
+    """Clear all users from AFK channel (Admin only)"""
+    if not AFK_CHANNEL_ID:
+        await ctx.send("❌ AFK channel not set")
+        return
+    
+    afk_channel = ctx.guild.get_channel(AFK_CHANNEL_ID)
+    if not afk_channel:
+        await ctx.send("❌ AFK channel not found")
+        return
+    
+    count = 0
+    for member in afk_channel.members:
+        if not member.bot:
+            try:
+                # Unmute and undeafen before moving
+                await member.edit(mute=False, deafen=False)
+                # Move to a general voice channel or disconnect
+                await member.move_to(None)  # Disconnect
+                count += 1
+                await asyncio.sleep(0.5)  # Rate limit prevention
+            except Exception as e:
+                print(f"❌ Error clearing {member.name}: {e}")
+    
+    await ctx.send(f"✅ Cleared {count} users from AFK channel")
+
 # Run the bot
 if __name__ == "__main__":
     if not TOKEN:
@@ -479,6 +779,8 @@ if __name__ == "__main__":
         exit(1)
     if GUILD_ID == 0:
         print("⚠️ WARNING: GUILD_ID not set!")
+    if AFK_CHANNEL_ID == 0:
+        print("⚠️ WARNING: AFK_CHANNEL_ID not set! Set it in environment variables.")
     
     print("🚀 Starting bot...")
     bot.run(TOKEN)
